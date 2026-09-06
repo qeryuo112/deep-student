@@ -393,21 +393,40 @@ const recoveryTree = (
   </ErrorBoundary>
 );
 
+// Android 冷启动竞态：早期发出的 invoke 可能在 WebView JS↔原生消息桥就绪前
+// 丢失（后端从未收到、Promise 永不 settle），单次 120s 死等会把竞态变成死局
+// （现场复现：三次启动 2 次 blocked）。改为短超时轮询重试：每次尝试独立限时，
+// 消息桥就绪后的重发必然到达后端；总窗口不变，全失败才进恢复壳。
+const PREFLIGHT_ATTEMPT_TIMEOUT_MS = 10_000;
+const PREFLIGHT_TOTAL_WINDOW_MS = 120_000;
+
 const getStartupRecoveryStatusWithTimeout = async () => {
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      getStartupRecoveryStatus(),
-      new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(
-          () => reject(new Error('Startup recovery preflight timed out after 120 seconds')),
-          120_000,
-        );
-      }),
-    ]);
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
+  const startedAt = Date.now();
+  let attempt = 0;
+  while (Date.now() - startedAt + PREFLIGHT_ATTEMPT_TIMEOUT_MS <= PREFLIGHT_TOTAL_WINDOW_MS) {
+    attempt += 1;
+    let attemptTimeoutId: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        getStartupRecoveryStatus(),
+        new Promise<never>((_, reject) => {
+          attemptTimeoutId = setTimeout(
+            () => reject(
+              new Error(`Startup recovery preflight attempt ${attempt} timed out after 10 seconds`),
+            ),
+            PREFLIGHT_ATTEMPT_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } catch (error) {
+      console.warn(`[main] Startup preflight attempt ${attempt} failed, retrying`, error);
+    } finally {
+      if (attemptTimeoutId) clearTimeout(attemptTimeoutId);
+    }
   }
+  throw new Error(
+    `Startup recovery preflight timed out after ${Math.round((Date.now() - startedAt) / 1000)} seconds (${attempt} attempts)`,
+  );
 };
 
 // F22: React 18 的 StrictMode 双调用诊断仅在开发态生效，生产构建为 no-op——
